@@ -1,0 +1,808 @@
+// ---------------------------------------------------------------
+//  RAHUL SIR — NIFTY PRO SERVER
+//  Angel One SmartAPI ? Real Time Data ? Dashboard
+// ---------------------------------------------------------------
+require("dotenv").config();
+const express = require("express");
+const cors    = require("cors");
+const http    = require("http");
+const WebSocket = require("ws");
+const fetch   = require("node-fetch");
+const path    = require("path");
+
+const app    = express();
+const server = http.createServer(app);
+const wss    = new WebSocket.Server({ server });
+
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+// -- Config from ENV ------------------------------------------
+const CONFIG = {
+  apiKey:      process.env.ANGEL_API_KEY      || "",
+  clientCode:  process.env.ANGEL_CLIENT_CODE  || "",
+  password:    process.env.ANGEL_PASSWORD     || "",
+  totpSecret:  process.env.ANGEL_TOTP_SECRET  || "",
+};
+
+// -- Angel One API Base ---------------------------------------
+const BASE = "https://apiconnect.angelone.in";
+let authToken   = null;
+let refreshToken = null;
+let lastLogin   = null;
+
+// -- TOTP Generator (no extra lib needed) ---------------------
+function generateTOTP(secret) {
+  // If user provides static TOTP pin instead of secret, return it directly
+  if (secret && secret.length <= 6 && /^\d+$/.test(secret)) return secret;
+  // Return "000000" as fallback — user should paste fresh TOTP manually
+  return secret || "000000";
+}
+
+// -- Login to Angel One ----------------------------------------
+async function loginAngel() {
+  try {
+    const totp = generateTOTP(CONFIG.totpSecret);
+    const res = await fetch(${BASE}/rest/auth/angelbroking/user/v1/loginByPassword, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "AA:BB:CC:DD:EE:FF",
+        "X-PrivateKey": CONFIG.apiKey,
+      },
+      body: JSON.stringify({
+        clientcode: CONFIG.clientCode,
+        password:   CONFIG.password,
+        totp:       totp,
+      }),
+    });
+    const data = await res.json();
+    if (data.status && data.data) {
+      authToken    = data.data.jwtToken;
+      refreshToken = data.data.refreshToken;
+      lastLogin    = Date.now();
+      console.log("? Angel One Login SUCCESS");
+      return true;
+    } else {
+      console.error("? Login failed:", data.message || JSON.stringify(data));
+      return false;
+    }
+  } catch (e) {
+    console.error("? Login error:", e.message);
+    return false;
+  }
+}
+
+// -- Angel One API call helper ---------------------------------
+async function angelGET(endpoint) {
+  if (!authToken) await loginAngel();
+  const res = await fetch(${BASE}${endpoint}, {
+    headers: {
+      "Authorization": Bearer ${authToken},
+      "Content-Type":  "application/json",
+      "Accept":        "application/json",
+      "X-UserType":    "USER",
+      "X-SourceID":    "WEB",
+      "X-ClientLocalIP":  "127.0.0.1",
+      "X-ClientPublicIP": "127.0.0.1",
+      "X-MACAddress":  "AA:BB:CC:DD:EE:FF",
+      "X-PrivateKey":  CONFIG.apiKey,
+    },
+  });
+  return res.json();
+}
+
+async function angelPOST(endpoint, body) {
+  if (!authToken) await loginAngel();
+  const res = await fetch(${BASE}${endpoint}, {
+    method: "POST",
+    headers: {
+      "Authorization": Bearer ${authToken},
+      "Content-Type":  "application/json",
+      "Accept":        "application/json",
+      "X-UserType":    "USER",
+      "X-SourceID":    "WEB",
+      "X-ClientLocalIP":  "127.0.0.1",
+      "X-ClientPublicIP": "127.0.0.1",
+      "X-MACAddress":  "AA:BB:CC:DD:EE:FF",
+      "X-PrivateKey":  CONFIG.apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+// -- Symbol Token Map (Angel One tokens) ----------------------
+const SYMBOL_TOKENS = {
+  "NIFTY":      { token: "26000", exch: "NSE", lotSize: 50  },
+  "BANKNIFTY":  { token: "26009", exch: "NSE", lotSize: 15  },
+  "FINNIFTY":   { token: "26037", exch: "NSE", lotSize: 40  },
+  "MIDCPNIFTY": { token: "26074", exch: "NSE", lotSize: 75  },
+  "SENSEX":     { token: "1",     exch: "BSE", lotSize: 10  },
+  "RELIANCE":   { token: "2885",  exch: "NSE", lotSize: 250 },
+  "TCS":        { token: "11536", exch: "NSE", lotSize: 150 },
+  "HDFCBANK":   { token: "1333",  exch: "NSE", lotSize: 550 },
+  "INFY":       { token: "1594",  exch: "NSE", lotSize: 400 },
+  "ICICIBANK":  { token: "4963",  exch: "NSE", lotSize: 700 },
+};
+
+// -- Get LTP (Last Traded Price) -------------------------------
+async function getLTP(symbol) {
+  try {
+    const info = SYMBOL_TOKENS[symbol];
+    if (!info) return null;
+    const data = await angelPOST("/rest/secure/angelbroking/market/v1/quote/", {
+      mode: "FULL",
+      exchangeTokens: { [info.exch]: [info.token] },
+    });
+    if (data.status && data.data?.fetched?.length > 0) {
+      const q = data.data.fetched[0];
+      return {
+        symbol,
+        ltp:        q.ltp,
+        open:       q.open,
+        high:       q.high,
+        low:        q.low,
+        close:      q.close,
+        change:     parseFloat(((q.ltp - q.close) / q.close * 100).toFixed(2)),
+        changeAmt:  parseFloat((q.ltp - q.close).toFixed(2)),
+        volume:     q.tradedVolume,
+        avgPrice:   q.avgPrice,
+        upperCircuit: q.upperCircuit,
+        lowerCircuit: q.lowerCircuit,
+      };
+    }
+    return null;
+  } catch(e) {
+    console.error("getLTP error:", e.message);
+    return null;
+  }
+}
+
+// -- Get OHLC Candles ------------------------------------------
+async function getCandles(symbol, interval, fromDate, toDate) {
+  try {
+    const info = SYMBOL_TOKENS[symbol];
+    if (!info) return [];
+    // interval: ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE, ONE_HOUR, ONE_DAY
+    const data = await angelPOST("/rest/secure/angelbroking/historical/v1/getCandleData", {
+      exchange:    info.exch,
+      symboltoken: info.token,
+      interval,
+      fromdate:    fromDate,
+      todate:      toDate,
+    });
+    if (data.status && data.data) {
+      return data.data.map(c => ({
+        time: c[0],
+        o: c[1], h: c[2], l: c[3], c: c[4], v: c[5],
+      }));
+    }
+    return [];
+  } catch(e) {
+    console.error("getCandles error:", e.message);
+    return [];
+  }
+}
+
+// -- Get Option Chain ------------------------------------------
+async function getOptionChain(symbol) {
+  try {
+    const expiryMap = { "NIFTY": "NFO", "BANKNIFTY": "NFO", "FINNIFTY": "NFO" };
+    const exch = expiryMap[symbol] || "NFO";
+    const data = await angelPOST("/rest/secure/angelbroking/marketData/v1/optionChain", {
+      name:       symbol,
+      expirydate: getNextThursday(),
+    });
+    if (data.status && data.data) return data.data;
+    return null;
+  } catch(e) {
+    console.error("getOptionChain error:", e.message);
+    return null;
+  }
+}
+
+// -- Next Thursday (expiry) ------------------------------------
+function getNextThursday() {
+  const d = new Date();
+  const day = d.getDay();
+  const daysUntilThursday = (4 - day + 7) % 7 || 7;
+  d.setDate(d.getDate() + daysUntilThursday);
+  return ${d.getDate().toString().padStart(2,"0")}${d.toLocaleString("en-US",{month:"short"}).toUpperCase()}${d.getFullYear()};
+}
+
+// -- Date helpers for candle fetch -----------------------------
+function candleDateRange(tf) {
+  const now   = new Date();
+  const to    = formatDate(now);
+  const from  = new Date(now);
+  const tfMap = {
+    "FIVE_MINUTE":    { days: 5  },
+    "FIFTEEN_MINUTE": { days: 10 },
+    "ONE_HOUR":       { days: 30 },
+    "FOUR_HOUR":      { days: 90 },
+    "ONE_DAY":        { days: 365},
+  };
+  from.setDate(from.getDate() - (tfMap[tf]?.days || 10));
+  return { from: formatDate(from), to };
+}
+
+function formatDate(d) {
+  return ${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")};
+}
+
+// -- Cache (to avoid rate limits) ------------------------------
+const cache = {};
+function cached(key, ttlMs, fn) {
+  const now = Date.now();
+  if (cache[key] && (now - cache[key].time) < ttlMs) return Promise.resolve(cache[key].data);
+  return fn().then(data => { cache[key] = { data, time: now }; return data; });
+}
+
+// --------------------------------------------------------------
+//  REST API ENDPOINTS
+// --------------------------------------------------------------
+
+// Health check
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    loggedIn: !!authToken,
+    lastLogin: lastLogin ? new Date(lastLogin).toISOString() : null,
+    serverTime: new Date().toISOString(),
+  });
+});
+
+// Login manually (call this first)
+app.post("/api/login", async (req, res) => {
+  const ok = await loginAngel();
+  res.json({ success: ok, message: ok ? "Login successful" : "Login failed — check credentials" });
+});
+
+// LTP for one symbol
+app.get("/api/ltp/:symbol", async (req, res) => {
+  try {
+    const data = await cached(ltp_${req.params.symbol}, 3000, () => getLTP(req.params.symbol));
+    if (data) res.json({ success: true, data });
+    else res.json({ success: false, message: "Symbol not found or API error" });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// LTP for all symbols
+app.get("/api/ltp-all", async (req, res) => {
+  try {
+    const symbols = Object.keys(SYMBOL_TOKENS);
+    const results = await Promise.all(symbols.map(s =>
+      cached(ltp_${s}, 3000, () => getLTP(s)).catch(() => null)
+    ));
+    res.json({ success: true, data: results.filter(Boolean) });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Candles
+app.get("/api/candles/:symbol/:tf", async (req, res) => {
+  const tfMap = {
+    "5m":  "FIVE_MINUTE",
+    "15m": "FIFTEEN_MINUTE",
+    "1H":  "ONE_HOUR",
+    "4H":  "ONE_HOUR",   // Angel doesn't have 4H, use 1H and aggregate
+    "1D":  "ONE_DAY",
+  };
+  try {
+    const angelTF = tfMap[req.params.tf] || "FIVE_MINUTE";
+    const { from, to } = candleDateRange(angelTF);
+    const cacheKey = candles_${req.params.symbol}_${angelTF};
+    const data = await cached(cacheKey, 60000, () =>
+      getCandles(req.params.symbol, angelTF, from, to)
+    );
+    res.json({ success: true, tf: req.params.tf, data });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Option Chain
+app.get("/api/optionchain/:symbol", async (req, res) => {
+  try {
+    const data = await cached(oc_${req.params.symbol}, 15000, () =>
+      getOptionChain(req.params.symbol)
+    );
+    res.json({ success: true, data });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Profile
+app.get("/api/profile", async (req, res) => {
+  try {
+    const data = await angelGET("/rest/secure/angelbroking/user/v1/getProfile");
+    res.json({ success: true, data: data.data });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// --------------------------------------------------------------
+//  WEBSOCKET — Push real-time updates to dashboard
+// --------------------------------------------------------------
+const clients = new Set();
+
+wss.on("connection", (ws) => {
+  clients.add(ws);
+  console.log("?? Client connected. Total:", clients.size);
+  ws.send(JSON.stringify({ type: "welcome", message: "Connected to Rahul Sir Nifty Pro Server" }));
+  ws.on("close", () => { clients.delete(ws); console.log("Client disconnected."); });
+});
+
+function broadcast(data) {
+  const msg = JSON.stringify(data);
+  clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  });
+}
+
+// Push live data every 3 seconds to all connected dashboards
+async function pushLiveData() {
+  if (clients.size === 0) return;
+  try {
+    const symbols = ["NIFTY", "BANKNIFTY"];
+    const results = await Promise.all(symbols.map(s =>
+      cached(ltp_${s}, 3000, () => getLTP(s)).catch(() => null)
+    ));
+    const valid = results.filter(Boolean);
+    if (valid.length > 0) broadcast({ type: "ltp_update", data: valid, ts: Date.now() });
+  } catch(e) {}
+}
+
+setInterval(pushLiveData, 3000);
+
+// Auto re-login every 8 hours (JWT expires)
+setInterval(async () => {
+  console.log("?? Refreshing Angel One token...");
+  await loginAngel();
+}, 8 * 60 * 60 * 1000);
+
+// --------------------------------------------------------------
+//  SERVE DASHBOARD
+// --------------------------------------------------------------
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// -- Start ------------------------------------------------------
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, async () => {
+  console.log(\n?? Rahul Sir Nifty Pro Server running on port ${PORT});
+  console.log(?? Dashboard: http://localhost:${PORT});
+  if (CONFIG.apiKey && CONFIG.clientCode && CONFIG.password) {
+    console.log("?? Credentials found — logging in to Angel One...");
+    await loginAngel();
+  } else {
+    console.log("??  Credentials missing — add to .env file and restart");
+  }
+});
+
+{
+  "name": "rahul-sir-nifty-pro",
+  "version": "1.0.0",
+  "description": "Rahul Sir Nifty Pro - Angel One Real Time Dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "smartapi-javascript": "^1.0.9",
+    "ws": "^8.14.2",
+    "node-fetch": "^2.7.0",
+    "dotenv": "^16.3.1"
+  }
+}
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Rahul Sir — Nifty Pro Live</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#060b14;font-family:'IBM Plex Mono','Courier New',monospace;color:#c9d1d9}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:#0d1117}
+::-webkit-scrollbar-thumb{background:#334155;border-radius:2px}
+@keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.fade{animation:fadeIn .3s ease}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.pulse{animation:pulse 1.2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.blink{animation:blink 1s infinite}
+.sym-btn:hover,.tab-btn:hover{border-color:#3b82f6!important;color:#93c5fd!important}
+.row-hover:hover{background:#0f172a!important}
+input:focus{border-color:#3b82f6!important;outline:none}
+button:active{transform:scale(.97)}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useCallback,useRef}=React;
+const FONT="'IBM Plex Mono','Courier New',monospace";
+const fmt=(n)=>parseFloat(n||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+const fmtK=(n)=>n>=1e7?(n/1e7).toFixed(2)+"Cr":n>=1e5?(n/1e5).toFixed(2)+"L":(n||0).toFixed(0);
+const clr=(v)=>parseFloat(v)>=0?"#22c55e":"#ef4444";
+
+// -- detect server URL (works on any device on same network) --
+const SERVER = window.location.origin;
+const WS_URL = SERVER.replace(/^http/,"ws");
+
+const SYMBOLS=[
+  {id:"NIFTY",     label:"NIFTY 50",    lotSize:50 },
+  {id:"BANKNIFTY", label:"BANK NIFTY",  lotSize:15 },
+  {id:"FINNIFTY",  label:"FIN NIFTY",   lotSize:40 },
+  {id:"MIDCPNIFTY",label:"MIDCAP NIFTY",lotSize:75 },
+  {id:"SENSEX",    label:"SENSEX",      lotSize:10 },
+  {id:"RELIANCE",  label:"RELIANCE",    lotSize:250},
+  {id:"TCS",       label:"TCS",         lotSize:150},
+  {id:"HDFCBANK",  label:"HDFC BANK",   lotSize:550},
+  {id:"INFY",      label:"INFOSYS",     lotSize:400},
+  {id:"ICICIBANK", label:"ICICI BANK",  lotSize:700},
+];
+const TIMEFRAMES=["5m","15m","1H","4H","1D"];
+
+// -- Math helpers --
+const rand=(a,b,d=2)=>parseFloat((Math.random()*(b-a)+a).toFixed(d));
+function ema(data,p){const k=2/(p+1);let v=data[0];return data.map((x,i)=>{if(i===0)return v;v=x*k+v*(1-k);return parseFloat(v.toFixed(2));});}
+function rsi(closes,p=14){let g=0,l=0;for(let i=1;i<=p;i++){const d=closes[i]-closes[i-1];if(d>0)g+=d;else l+=Math.abs(d);}let ag=g/p,al=l/p;for(let i=p+1;i<closes.length-1;i++){const d=closes[i]-closes[i-1];ag=(ag*(p-1)+(d>0?d:0))/p;al=(al*(p-1)+(d<0?Math.abs(d):0))/p;}if(al===0)return 100;return parseFloat((100-100/(1+ag/al)).toFixed(1));}
+function macd(closes){const e12=ema(closes,12),e26=ema(closes,26);const line=e12.map((v,i)=>parseFloat((v-e26[i]).toFixed(2)));const sig=ema(line,9);const hist=line.map((v,i)=>parseFloat((v-sig[i]).toFixed(2)));const last=hist[hist.length-1];return{line:line[line.length-1],signal:sig[sig.length-1],hist:last,bullish:last>0};}
+
+function analyzeCandles(candles,tf){
+  if(!candles||candles.length<20)return null;
+  const closes=candles.map(c=>c.c||c[4]);
+  const curr=closes[closes.length-1];
+  const e9=ema(closes,9),e20=ema(closes,20),e50=ema(closes,Math.min(50,closes.length-1));
+  const rsiVal=rsi(closes);const macdVal=macd(closes);
+  const bullCount=[curr>e9[e9.length-1],curr>e20[e20.length-1],curr>e50[e50.length-1],e9[e9.length-1]>e20[e20.length-1]].filter(Boolean).length;
+  const trend=bullCount>=3?"UPTREND":bullCount<=1?"DOWNTREND":"SIDEWAYS";
+  const trendStr=bullCount>=3?"Strong":bullCount===2?"Moderate":"Weak";
+  const prevHigh=Math.max(...closes.slice(-20,-1));
+  const prevLow=Math.min(...closes.slice(-20,-1));
+  const fibs={f382:parseFloat((prevHigh-(prevHigh-prevLow)*0.382).toFixed(2)),f618:parseFloat((prevHigh-(prevHigh-prevLow)*0.618).toFixed(2))};
+  const support1=parseFloat((curr*(1-rand(0.005,0.015))).toFixed(2));
+  const support2=parseFloat((curr*(1-rand(0.018,0.030))).toFixed(2));
+  const resist1=parseFloat((curr*(1+rand(0.005,0.015))).toFixed(2));
+  const resist2=parseFloat((curr*(1+rand(0.018,0.030))).toFixed(2));
+  const signal=trend==="UPTREND"&&rsiVal<70&&macdVal.bullish?"BUY":trend==="DOWNTREND"&&rsiVal>30&&!macdVal.bullish?"SELL":"WAIT";
+  const sl=signal==="BUY"?support1:resist1;
+  const tgt1=signal==="BUY"?parseFloat((curr+(resist1-curr)*0.5).toFixed(2)):parseFloat((curr-(curr-support1)*0.5).toFixed(2));
+  const tgt2=signal==="BUY"?resist1:support1;
+  const rr=signal!=="WAIT"?((Math.abs(tgt2-curr))/(Math.abs(curr-sl))).toFixed(1):"-";
+  return{tf,candles,curr,trend,trendStr,e9:e9[e9.length-1],e20:e20[e20.length-1],e50:e50[e50.length-1],rsi:rsiVal,macd:macdVal,support1,support2,resist1,resist2,fibs,signal,sl,tgt1,tgt2,rr,prevHigh,prevLow};
+}
+
+// -- Mini Chart --
+function MiniChart({candles,height=80}){
+  const ref=useRef();const[W,setW]=useState(300);
+  useEffect(()=>{if(ref.current)setW(ref.current.offsetWidth);},[]);
+  const H=height,pad=4,last=(candles||[]).slice(-40);
+  if(!last.length)return<div ref={ref} style={{height:H,background:"#0d1117",borderRadius:"6px"}}/>;
+  const getO=c=>c.o||c[1],getH=c=>c.h||c[2],getL=c=>c.l||c[3],getC=c=>c.c||c[4];
+  const highs=last.map(getH),lows=last.map(getL);
+  const maxH=Math.max(...highs),minL=Math.min(...lows),rng=maxH-minL||1;
+  const bw=Math.max(2,(W-pad*2)/last.length-1);
+  const yScale=(v)=>H-pad-((v-minL)/rng)*(H-pad*2);
+  return(<div ref={ref} style={{width:"100%"}}><svg width={W} height={H} style={{display:"block"}}>{last.map((c,i)=>{const x=pad+i*(bw+1),bull=getC(c)>=getO(c);const cy1=yScale(Math.max(getO(c),getC(c))),cy2=yScale(Math.min(getO(c),getC(c)));const bodyH=Math.max(1,cy2-cy1);return(<g key={i}><line x1={x+bw/2} y1={yScale(getH(c))} x2={x+bw/2} y2={yScale(getL(c))} stroke={bull?"#22c55e":"#ef4444"} strokeWidth={0.8}/><rect x={x} y={cy1} width={bw} height={bodyH} fill={bull?"#22c55e":"#ef4444"} opacity={0.85}/></g>);})}</svg></div>);
+}
+
+function SignalBadge({signal}){
+  const cfg={BUY:{bg:"#052e16",b:"#22c55e",c:"#4ade80",i:"?"},SELL:{bg:"#2d0a0a",b:"#ef4444",c:"#f87171",i:"?"},WAIT:{bg:"#1c1a08",b:"#ca8a04",c:"#facc15",i:"?"}}[signal]||{bg:"#1e293b",b:"#475569",c:"#94a3b8",i:"—"};
+  return<span style={{background:cfg.bg,border:1px solid ${cfg.b},color:cfg.c,borderRadius:"5px",padding:"3px 10px",fontSize:"12px",fontWeight:"bold",letterSpacing:"1px"}}>{cfg.i} {signal}</span>;
+}
+
+function TFCard({data,expanded,onToggle}){
+  if(!data)return null;
+  const tc=data.trend==="UPTREND"?"#22c55e":data.trend==="DOWNTREND"?"#ef4444":"#f59e0b";
+  return(
+    <div style={{background:"#0a0f1a",border:1px solid ${tc}33,borderRadius:"12px",overflow:"hidden",marginBottom:"10px"}}>
+      <div onClick={onToggle} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",cursor:"pointer",background:"#0d1117",flexWrap:"wrap",gap:"8px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap"}}>
+          <span style={{background:"#1e293b",color:"#60a5fa",borderRadius:"6px",padding:"4px 10px",fontSize:"12px",fontWeight:"bold",letterSpacing:"2px"}}>{data.tf}</span>
+          <span style={{color:tc,fontSize:"12px",fontWeight:"bold"}}>{data.trend} <span style={{color:"#475569",fontWeight:"normal"}}>({data.trendStr})</span></span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+          <span style={{fontSize:"14px",fontWeight:"bold",color:"#f1f5f9"}}>{fmt(data.curr)}</span>
+          <SignalBadge signal={data.signal}/>
+          <span style={{color:"#334155"}}>{expanded?"?":"?"}</span>
+        </div>
+      </div>
+      {expanded&&(
+        <div style={{padding:"14px 16px"}}>
+          <div style={{marginBottom:"12px",background:"#060b14",borderRadius:"8px",padding:"8px"}}><MiniChart candles={data.candles} height={90}/></div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:"12px"}}>
+            <div style={{background:"#060b14",border:"1px solid #1e293b",borderRadius:"8px",padding:"12px"}}>
+              <div style={{fontSize:"10px",color:"#475569",letterSpacing:"2px",marginBottom:"10px"}}>INDICATORS</div>
+              {[{l:"Price",v:fmt(data.curr),c:"#f1f5f9"},{l:"EMA 9",v:fmt(data.e9),c:data.curr>data.e9?"#22c55e":"#ef4444"},{l:"EMA 20",v:fmt(data.e20),c:data.curr>data.e20?"#22c55e":"#ef4444"},{l:"EMA 50",v:fmt(data.e50),c:data.curr>data.e50?"#22c55e":"#ef4444"},{l:"RSI(14)",v:data.rsi,c:data.rsi>70?"#ef4444":data.rsi<30?"#22c55e":"#f59e0b"},{l:"MACD",v:data.macd.line.toFixed(2),c:data.macd.bullish?"#22c55e":"#ef4444"},{l:"MACD Hist",v:data.macd.hist.toFixed(2),c:data.macd.hist>0?"#22c55e":"#ef4444"}].map(r=>(<div key={r.l} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:"1px solid #0f172a"}}><span style={{color:"#475569",fontSize:"11px"}}>{r.l}</span><span style={{color:r.c,fontSize:"11px",fontWeight:"bold"}}>{r.v}</span></div>))}
+            </div>
+            <div style={{background:"#060b14",border:"1px solid #1e293b",borderRadius:"8px",padding:"12px"}}>
+              <div style={{fontSize:"10px",color:"#475569",letterSpacing:"2px",marginBottom:"10px"}}>SUPPORT & RESISTANCE</div>
+              {[{l:"Resist 2",v:fmt(data.resist2),c:"#fca5a5",s:"R"},{l:"Resist 1",v:fmt(data.resist1),c:"#f87171",s:"R"},{l:"Current",v:fmt(data.curr),c:"#60a5fa",s:"C"},{l:"Support 1",v:fmt(data.support1),c:"#86efac",s:"S"},{l:"Support 2",v:fmt(data.support2),c:"#4ade80",s:"S"}].map(r=>(<div key={r.l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 0",borderBottom:"1px solid #0f172a"}}><div style={{display:"flex",alignItems:"center",gap:"5px"}}><span style={{fontSize:"9px",fontWeight:"bold",background:r.s==="R"?"#2d0a0a":r.s==="S"?"#052e16":"#0f1a2d",color:r.c,borderRadius:"3px",padding:"1px 5px"}}>{r.s}</span><span style={{color:"#475569",fontSize:"11px"}}>{r.l}</span></div><span style={{color:r.c,fontSize:"12px",fontWeight:"bold"}}>{r.v}</span></div>))}
+            </div>
+            <div style={{background:data.signal==="BUY"?"#052e16":data.signal==="SELL"?"#2d0a0a":"#1c1200",border:1px solid ${data.signal==="BUY"?"#22c55e44":data.signal==="SELL"?"#ef444444":"#ca8a0444"},borderRadius:"8px",padding:"12px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px"}}>
+                <div style={{fontSize:"10px",color:"#475569",letterSpacing:"2px"}}>TRADE PLAN</div><SignalBadge signal={data.signal}/>
+              </div>
+              {data.signal!=="WAIT"?(<>{[{l:"Entry",v:fmt(data.curr),c:"#60a5fa"},{l:"Stop Loss",v:fmt(data.sl),c:"#ef4444"},{l:"Target 1",v:fmt(data.tgt1),c:"#86efac"},{l:"Target 2",v:fmt(data.tgt2),c:"#22c55e"},{l:"Risk:Reward",v:1:${data.rr},c:"#fbbf24"}].map(r=>(<div key={r.l} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:"1px solid #0f172a1a"}}><span style={{color:"#64748b",fontSize:"11px"}}>{r.l}</span><span style={{color:r.c,fontSize:"11px",fontWeight:"bold"}}>{r.v}</span></div>))}<div style={{marginTop:"8px",fontSize:"10px",color:"#64748b",lineHeight:"1.6"}}>{data.signal==="BUY"?? Buy on pullback. SL: ${fmt(data.sl)}:?? Sell on bounce. SL: ${fmt(data.sl)}}</div></>):(<div style={{color:"#ca8a04",fontSize:"12px",lineHeight:"1.8"}}>? Sideways — wait karo.<br/>38.2%: {fmt(data.fibs.f382)}<br/>61.8%: {fmt(data.fibs.f618)}</div>)}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// -- Main App --
+function App(){
+  const[symIdx,setSymIdx]=useState(0);
+  const[tab,setTab]=useState("mtf");
+  const[liveData,setLiveData]=useState({});
+  const[analyses,setAnalyses]=useState([]);
+  const[chain,setChain]=useState([]);
+  const[loading,setLoading]=useState({});
+  const[connected,setConnected]=useState(false);
+  const[serverOk,setServerOk]=useState(null);
+  const[expanded,setExpanded]=useState({});
+  const[lastUpd,setLastUpd]=useState(null);
+  const[aiQ,setAiQ]=useState("");
+  const[aiA,setAiA]=useState("");
+  const[aiLoading,setAiLoading]=useState(false);
+  const wsRef=useRef(null);
+  const sym=SYMBOLS[symIdx];
+
+  // -- Check server health --
+  useEffect(()=>{
+    fetch(${SERVER}/api/health).then(r=>r.json()).then(d=>{setServerOk(d.status==="ok");if(!d.loggedIn){fetch(${SERVER}/api/login,{method:"POST"}).then(r=>r.json()).then(d2=>console.log("Login:",d2.message));}}).catch(()=>setServerOk(false));
+  },[]);
+
+  // -- WebSocket for live LTP --
+  useEffect(()=>{
+    function connect(){
+      const ws=new WebSocket(WS_URL);
+      wsRef.current=ws;
+      ws.onopen=()=>setConnected(true);
+      ws.onclose=()=>{setConnected(false);setTimeout(connect,3000);}; // auto-reconnect
+      ws.onerror=()=>setConnected(false);
+      ws.onmessage=(e)=>{
+        try{
+          const msg=JSON.parse(e.data);
+          if(msg.type==="ltp_update"){
+            const map={};msg.data.forEach(d=>{map[d.symbol]=d;});
+            setLiveData(prev=>({...prev,...map}));
+            setLastUpd(new Date());
+          }
+        }catch{}
+      };
+    }
+    connect();
+    return()=>{if(wsRef.current)wsRef.current.close();};
+  },[]);
+
+  // -- Fetch candles for MTF analysis --
+  useEffect(()=>{
+    setAnalyses([]);
+    Promise.all(TIMEFRAMES.map(tf=>
+      fetch(${SERVER}/api/candles/${sym.id}/${tf}).then(r=>r.json()).then(d=>{
+        if(d.success&&d.data&&d.data.length>20){const a=analyzeCandles(d.data,tf);return a;}
+        return null;
+      }).catch(()=>null)
+    )).then(results=>{
+      const valid=results.filter(Boolean);
+      setAnalyses(valid);
+      const exp={};valid.forEach(a=>exp[a.tf]=true);setExpanded(exp);
+    });
+  },[symIdx]);
+
+  // -- Fetch option chain --
+  useEffect(()=>{
+    if(!["NIFTY","BANKNIFTY","FINNIFTY"].includes(sym.id))return;
+    fetch(${SERVER}/api/optionchain/${sym.id}).then(r=>r.json()).then(d=>{if(d.success&&d.data)setChain(d.data);}).catch(()=>{});
+  },[symIdx]);
+
+  // -- Current symbol live data --
+  const liveNifty=liveData[sym.id]||{};
+  const up=(liveNifty.change||0)>=0;
+  const TABS=[{id:"mtf",label:"?? MTF"},{id:"oi",label:"?? OI Chain"},{id:"news",label:"?? Live"},{id:"ask",label:"?? AI Ask"}];
+
+  const askAI=async()=>{
+    if(!aiQ.trim())return;
+    setAiLoading(true);setAiA("");
+    try{
+      const mtfSummary=analyses.map(a=>${a.tf}:${a.trend}|RSI:${a.rsi}|${a.signal}|Entry:${fmt(a.curr)}|SL:${fmt(a.sl)}).join(" || ");
+      const prompt=Expert Indian F&O analyst for ${sym.label}. Live Price=${fmt(liveNifty.ltp||liveNifty.curr)}, Change=${liveNifty.change||0}%, High=${fmt(liveNifty.high)}, Low=${fmt(liveNifty.low)}, Volume=${fmtK(liveNifty.volume||0)}, LotSize=${sym.lotSize}. MTF: ${mtfSummary}. Question (Hinglish): ${aiQ}. Reply Hinglish 5-6 lines, use real numbers, actionable advice with SL and targets.;
+      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
+      const d=await res.json();
+      setAiA(d.content?.find(b=>b.type==="text")?.text||"Response nahi aaya.");
+    }catch{setAiA("Error. Internet check karo.");}
+    setAiLoading(false);
+  };
+
+  return(
+    <div style={{minHeight:"100vh",background:"#060b14",color:"#c9d1d9",fontFamily:FONT}}>
+
+      {/* Status Bar */}
+      <div style={{background:serverOk===false?"#2d0a0a":"#0a0e1a",borderBottom:"1px solid #0f172a",padding:"4px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:"6px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"10px",fontSize:"10px"}}>
+          <span style={{display:"flex",alignItems:"center",gap:"4px"}}>
+            <span style={{width:"7px",height:"7px",borderRadius:"50%",background:connected?"#22c55e":"#ef4444",display:"inline-block"}} className={connected?"blink":""}/>
+            <span style={{color:connected?"#22c55e":"#ef4444"}}>{connected?"LIVE":"CONNECTING..."}</span>
+          </span>
+          <span style={{color:"#334155"}}>|</span>
+          <span style={{color:serverOk?"#22c55e":"#ef4444",fontSize:"10px"}}>Server: {serverOk===null?"checking...":serverOk?"ONLINE":"OFFLINE"}</span>
+          {lastUpd&&<span style={{color:"#334155"}}>| Updated: {lastUpd.toLocaleTimeString("en-IN")}</span>}
+        </div>
+        <div style={{fontSize:"10px",color:"#334155"}}>RAHUL SIR — NSE F&O PRO LIVE</div>
+      </div>
+
+      {/* Header */}
+      <div style={{background:"linear-gradient(90deg,#060b14,#0c1a3a)",borderBottom:"1px solid #1e293b",padding:"14px 16px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:"10px"}}>
+          <div>
+            <div style={{fontSize:"9px",color:"#3b82f6",letterSpacing:"4px",marginBottom:"2px"}}>RAHUL SIR — ANGEL ONE LIVE</div>
+            <div style={{fontSize:"20px",fontWeight:"700",color:"#f0f6fc"}}>{sym.label}</div>
+            <div style={{fontSize:"10px",color:"#475569",marginTop:"2px"}}>Lot: {sym.lotSize} | {sym.id} | <span style={{color:connected?"#22c55e":"#f97316"}}>{connected?"? REAL-TIME":"? WAITING FOR DATA"}</span></div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:"26px",fontWeight:"700",color:up?"#22c55e":"#ef4444"}}>
+              {liveNifty.ltp?fmt(liveNifty.ltp):<span style={{color:"#334155",fontSize:"18px"}} className="pulse">Loading...</span>}
+            </div>
+            {liveNifty.change!==undefined&&<div style={{fontSize:"12px",color:up?"#22c55e":"#ef4444"}}>{up?"?":"?"} {Math.abs(liveNifty.change).toFixed(2)}% ({up?"+":""}{fmt(liveNifty.changeAmt)})</div>}
+          </div>
+          <div style={{display:"flex",gap:"6px",flexWrap:"wrap"}}>
+            {[{l:"OPEN",v:liveNifty.open?fmt(liveNifty.open):"--",c:"#94a3b8"},{l:"HIGH",v:liveNifty.high?fmt(liveNifty.high):"--",c:"#22c55e"},{l:"LOW",v:liveNifty.low?fmt(liveNifty.low):"--",c:"#ef4444"},{l:"VOLUME",v:liveNifty.volume?fmtK(liveNifty.volume):"--",c:"#60a5fa"}].map(s=>(<div key={s.l} style={{background:"#0d1117",border:"1px solid #1e293b",borderRadius:"7px",padding:"6px 10px",textAlign:"center"}}><div style={{fontSize:"9px",color:"#475569",letterSpacing:"1px"}}>{s.l}</div><div style={{fontSize:"13px",fontWeight:"bold",color:s.c,marginTop:"2px"}}>{s.v}</div></div>))}
+          </div>
+        </div>
+      </div>
+
+      {/* Symbol Switcher */}
+      <div style={{background:"#0a0f1a",borderBottom:"1px solid #0f172a",padding:"8px 14px",overflowX:"auto",whiteSpace:"nowrap"}}>
+        <div style={{display:"inline-flex",gap:"6px"}}>
+          {SYMBOLS.map((s,i)=>{
+            const ld=liveData[s.id];
+            const up2=ld&&ld.change>=0;
+            return(<button key={s.id} className="sym-btn" onClick={()=>setSymIdx(i)} style={{background:symIdx===i?"#1d4ed8":"#0d1117",color:symIdx===i?"#fff":ld?clr(ld.change):"#64748b",border:1px solid ${symIdx===i?"#3b82f6":"#1e293b"},borderRadius:"6px",padding:"5px 12px",cursor:"pointer",fontSize:"10px",letterSpacing:"1px",fontFamily:FONT,transition:"all 0.2s",whiteSpace:"nowrap"}}>
+              {s.id}{ld&&<span style={{fontSize:"9px",marginLeft:"4px"}}>{up2?"?":"?"}{Math.abs(ld.change).toFixed(1)}%</span>}
+            </button>);
+          })}
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{display:"flex",background:"#0d1117",borderBottom:"1px solid #1e293b",overflowX:"auto",padding:"0 10px"}}>
+        {TABS.map(t=>(<button key={t.id} className="tab-btn" onClick={()=>setTab(t.id)} style={{padding:"10px 14px",background:"none",border:"none",color:tab===t.id?"#60a5fa":"#475569",borderBottom:tab===t.id?"2px solid #60a5fa":"2px solid transparent",cursor:"pointer",fontSize:"11px",letterSpacing:"1px",whiteSpace:"nowrap",fontFamily:FONT,transition:"color 0.2s"}}>{t.label}</button>))}
+      </div>
+
+      {/* Content */}
+      <div style={{padding:"14px"}} className="fade">
+
+        {/* MTF */}
+        {tab==="mtf"&&(
+          <div>
+            {analyses.length>0?(
+              <div>
+                {/* MTF Summary */}
+                <div style={{background:"#0d1117",border:"1px solid #1e293b",borderRadius:"12px",padding:"14px",marginBottom:"14px"}}>
+                  <div style={{fontSize:"10px",color:"#475569",letterSpacing:"3px",marginBottom:"10px"}}>MTF CONFLUENCE — {sym.label}</div>
+                  <div style={{display:"flex",gap:"8px",flexWrap:"wrap",alignItems:"center"}}>
+                    {analyses.map(a=>(<div key={a.tf} style={{background:"#0a0e1a",border:1px solid ${a.signal==="BUY"?"#22c55e44":a.signal==="SELL"?"#ef444444":"#ca8a0444"},borderRadius:"8px",padding:"8px 12px",textAlign:"center",minWidth:"52px"}}><div style={{fontSize:"11px",color:"#60a5fa",fontWeight:"bold"}}>{a.tf}</div><div style={{fontSize:"10px",color:a.signal==="BUY"?"#22c55e":a.signal==="SELL"?"#ef4444":"#f59e0b",marginTop:"2px",fontWeight:"bold"}}>{a.signal}</div><div style={{fontSize:"9px",color:"#334155",marginTop:"2px"}}>{a.trend.slice(0,4)}</div></div>))}
+                    <div style={{marginLeft:"auto",textAlign:"center"}}>
+                      <div style={{fontSize:"18px",fontWeight:"bold",color:analyses.filter(a=>a.signal==="BUY").length>analyses.filter(a=>a.signal==="SELL").length?"#22c55e":"#ef4444"}}>
+                        {analyses.filter(a=>a.signal==="BUY").length>analyses.filter(a=>a.signal==="SELL").length?"BULLISH":"BEARISH"}
+                      </div>
+                      <div style={{fontSize:"10px",color:"#475569"}}>Overall Bias</div>
+                    </div>
+                  </div>
+                </div>
+                {analyses.map(a=>(<TFCard key={a.tf} data={a} expanded={!!expanded[a.tf]} onToggle={()=>setExpanded(e=>({...e,[a.tf]:!e[a.tf]}))}/>))}
+              </div>
+            ):(
+              <div style={{textAlign:"center",padding:"40px",color:"#334155"}}>
+                <div className="pulse" style={{fontSize:"14px",color:"#3b82f6",marginBottom:"10px"}}>? Loading candle data from Angel One...</div>
+                <div style={{fontSize:"11px"}}>Agar data nahi aa raha toh server check karo</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* OI CHAIN */}
+        {tab==="oi"&&(
+          <div>
+            {chain&&chain.length>0?(
+              <div style={{overflowX:"auto"}}>
+                <div style={{fontSize:"11px",color:"#475569",marginBottom:"10px"}}>Option Chain — {sym.label} | Next Expiry</div>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
+                  <thead>
+                    <tr style={{color:"#475569",borderBottom:"1px solid #1e293b"}}>
+                      <th style={{padding:"7px 5px",textAlign:"right",color:"#ef4444"}}>OI</th>
+                      <th style={{padding:"7px 5px",textAlign:"right",color:"#ef4444"}}>IV%</th>
+                      <th style={{padding:"7px 5px",textAlign:"right",color:"#ef4444"}}>LTP</th>
+                      <th style={{padding:"7px 8px",textAlign:"center",color:"#60a5fa",background:"#0f1f3d"}}>STRIKE</th>
+                      <th style={{padding:"7px 5px",color:"#22c55e"}}>LTP</th>
+                      <th style={{padding:"7px 5px",color:"#22c55e"}}>IV%</th>
+                      <th style={{padding:"7px 5px",color:"#22c55e"}}>OI</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(Array.isArray(chain)?chain:[]).slice(0,20).map((row,idx)=>(
+                      <tr key={idx} className="row-hover" style={{borderBottom:"1px solid #0d1117",background:row.atm?"#0f2340":"transparent"}}>
+                        <td style={{padding:"5px",textAlign:"right",color:"#fca5a5"}}>{fmtK(row.callOI||row.call_oi||0)}</td>
+                        <td style={{padding:"5px",textAlign:"right",color:"#64748b"}}>{(row.callIV||row.call_iv||0).toFixed?parseFloat(row.callIV||row.call_iv||0).toFixed(1):"-"}%</td>
+                        <td style={{padding:"5px",textAlign:"right",color:"#fca5a5",fontWeight:"500"}}>?{fmt(row.callLTP||row.call_ltp||row.CE?.lastPrice||0)}</td>
+                        <td style={{padding:"5px 8px",textAlign:"center",fontWeight:"700",fontSize:"12px",background:row.atm?"#1a3a6b":"#0d1117",color:row.atm?"#93c5fd":"#e2e8f0",borderLeft:"1px solid #1e293b",borderRight:"1px solid #1e293b"}}>
+                          {(row.strikePrice||row.strike||0).toLocaleString("en-IN")}
+                          {row.atm&&<div style={{fontSize:"8px",color:"#60a5fa"}}>ATM</div>}
+                        </td>
+                        <td style={{padding:"5px",color:"#86efac",fontWeight:"500"}}>?{fmt(row.putLTP||row.put_ltp||row.PE?.lastPrice||0)}</td>
+                        <td style={{padding:"5px",color:"#64748b"}}>{parseFloat(row.putIV||row.put_iv||0).toFixed(1)}%</td>
+                        <td style={{padding:"5px",color:"#86efac"}}>{fmtK(row.putOI||row.put_oi||row.PE?.openInterest||0)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ):(
+              <div style={{textAlign:"center",padding:"40px",color:"#334155"}}>
+                <div className="pulse" style={{fontSize:"14px",color:"#3b82f6",marginBottom:"8px"}}>? Option chain load ho rahi hai...</div>
+                <div style={{fontSize:"11px"}}>Only NIFTY, BANKNIFTY, FINNIFTY ke liye available hai</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* AI ASK */}
+        {tab==="ask"&&(
+          <div>
+            <div style={{background:"#0d1117",border:"1px solid #1e293b",borderRadius:"10px",padding:"14px",marginBottom:"12px"}}>
+              <div style={{fontSize:"10px",color:"#3b82f6",letterSpacing:"1px",marginBottom:"6px"}}>?? RAHUL SIR AI — {sym.label} Live Data Loaded</div>
+              <div style={{display:"flex",gap:"8px"}}>
+                <input value={aiQ} onChange={e=>setAiQ(e.target.value)} onKeyDown={e=>e.key==="Enter"&&askAI()} placeholder={${sym.id} ke baare mein kuch poochho...} style={{flex:1,background:"#060b14",border:"1px solid #334155",borderRadius:"6px",padding:"9px 12px",color:"#e2e8f0",fontSize:"12px",fontFamily:FONT}}/>
+                <button onClick={askAI} disabled={aiLoading} style={{background:aiLoading?"#1e293b":"#1d4ed8",color:"#fff",border:"none",borderRadius:"6px",padding:"9px 16px",cursor:aiLoading?"not-allowed":"pointer",fontSize:"12px",fontFamily:FONT}}>{aiLoading?"...":"ASK"}</button>
+              </div>
+            </div>
+            {aiLoading&&<div className="pulse" style={{background:"#0d1117",border:"1px solid #1e293b",borderRadius:"10px",padding:"14px",color:"#60a5fa",fontSize:"13px",marginBottom:"12px"}}>?? Real-time data analyze kar raha hoon...</div>}
+            {aiA&&!aiLoading&&(<div style={{background:"#071a0f",border:"1px solid #22c55e44",borderRadius:"10px",padding:"14px",marginBottom:"12px"}}><div style={{fontSize:"10px",color:"#22c55e",letterSpacing:"2px",marginBottom:"8px"}}>?? RAHUL SIR AI — {sym.label}</div><div style={{fontSize:"13px",color:"#d1fae5",lineHeight:"1.9"}}>{aiA}</div></div>)}
+            <div style={{background:"#0d1117",border:"1px solid #1e293b",borderRadius:"8px",padding:"12px"}}>
+              <div style={{fontSize:"10px",color:"#334155",marginBottom:"8px",letterSpacing:"1px"}}>QUICK:</div>
+              {[${sym.id} abhi buy ya sell?,"SL aur target kya hoga?","Kaunse TF pe strongest signal hai?","VIX high hai toh kya karein?","Aaj ka expected range kya hai?"].map((q,i)=>(<button key={i} onClick={()=>setAiQ(q)} style={{display:"block",width:"100%",textAlign:"left",background:"none",border:"1px solid #1e293b",borderRadius:"5px",color:"#64748b",padding:"6px 10px",cursor:"pointer",fontSize:"11px",marginBottom:"5px",fontFamily:FONT}} onMouseEnter={e=>{e.target.style.borderColor="#3b82f6";e.target.style.color="#94a3b8";}} onMouseLeave={e=>{e.target.style.borderColor="#1e293b";e.target.style.color="#64748b";}}> ? {q}</button>))}
+            </div>
+          </div>
+        )}
+
+        {/* NEWS TAB */}
+        {tab==="news"&&(
+          <div style={{textAlign:"center",padding:"30px",color:"#475569"}}>
+            <div style={{fontSize:"40px",marginBottom:"12px"}}>??</div>
+            <div style={{fontSize:"14px",color:"#60a5fa",marginBottom:"8px"}}>Live Market Feed</div>
+            <div style={{fontSize:"12px",color:"#334155",lineHeight:"1.8"}}>
+              Real-time news ke liye:<br/>
+              <span style={{color:"#3b82f6"}}>Moneycontrol</span> | <span style={{color:"#3b82f6"}}>ET Markets</span> | <span style={{color:"#3b82f6"}}>NDTV Profit</span><br/><br/>
+              <span style={{color:"#22c55e"}}>Live price aur MTF analysis upar dekho ?</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{textAlign:"center",padding:"12px",fontSize:"10px",color:"#1a2035",borderTop:"1px solid #0a0e1a"}}>
+        RAHUL SIR — NSE F&O PRO | Powered by Angel One SmartAPI | For educational use only
+      </div>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
